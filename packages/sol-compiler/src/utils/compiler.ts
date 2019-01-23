@@ -1,8 +1,10 @@
 import { ContractSource, Resolver } from '@0x/sol-resolver';
 import { fetchAsync, logUtils } from '@0x/utils';
 import chalk from 'chalk';
+import { execSync } from 'child_process';
 import { ContractArtifact } from 'ethereum-types';
 import * as ethUtil from 'ethereumjs-util';
+import * as fs from 'fs';
 import * as _ from 'lodash';
 import * as path from 'path';
 import * as requireFromString from 'require-from-string';
@@ -121,7 +123,7 @@ export function parseDependencies(contractSource: ContractSource): string[] {
  * @param solcInstance Instance of a solc compiler
  * @param standardInput Solidity standard JSON input
  */
-export function compile(
+export function compileSolcJS(
     resolver: Resolver,
     solcInstance: solc.SolcInstance,
     standardInput: solc.StandardInput,
@@ -137,6 +139,54 @@ export function compile(
     }
     return compiled;
 }
+
+/**
+ * Compiles the contracts and prints errors/warnings
+ * @param resolver Resolver
+ * @param solcVersion Version of a solc compiler
+ * @param standardInput Solidity standard JSON input
+ */
+export function compileDocker(
+    resolver: Resolver,
+    contractsDir: string,
+    solcVersion: string,
+    standardInput: solc.StandardInput,
+): solc.StandardOutput {
+    const standardInputDocker = _.cloneDeep(standardInput);
+    const projectRoot = process.cwd();
+    const workspaceRoot = path.join(projectRoot, '../..');
+    const packageJSON = JSON.parse(fs.readFileSync('package.json').toString());
+    const dependencies = { ...packageJSON.dependencies, ...packageJSON.devDependencies };
+    standardInputDocker.settings.remappings = _.map(
+        dependencies,
+        (_dependencyVersion: string, dependencyName: string) =>
+            `${dependencyName}=${workspaceRoot}/node_modules/${dependencyName}`,
+    );
+    // console.log(JSON.stringify(standardInputDocker, null, 2));
+    standardInputDocker.sources = _.mapKeys(
+        standardInputDocker.sources,
+        (_source: solc.Source, sourcePath: string) => resolver.resolve(sourcePath).absolutePath,
+    );
+    // console.log(JSON.stringify(standardInputDocker, null, 2));
+    const standardInputStrDocker = JSON.stringify(standardInputDocker, null, 2);
+    const dockerCommand =
+        `docker run -i -a stdin -a stdout -a stderr -v ${workspaceRoot}:${workspaceRoot} ethereum/solc:${solcVersion} ` +
+        `solc --standard-json --allow-paths ${workspaceRoot}`;
+    const standardOutputStrDocker = execSync(dockerCommand, { input: standardInputStrDocker }).toString();
+    const compiledDocker: solc.StandardOutput = JSON.parse(standardOutputStrDocker);
+    compiledDocker.sources = _.mapKeys(compiledDocker.sources, (_val: any, sourcePath: string) =>
+        sourcePath.replace(`${contractsDir}/`, ''),
+    );
+    compiledDocker.contracts = _.mapKeys(compiledDocker.contracts, (_val: any, contractPath: string) =>
+        contractPath.replace(`${contractsDir}/`, ''),
+    );
+    // console.log(JSON.stringify(compiledDocker, null, 2));
+    if (!_.isUndefined(compiledDocker.errors)) {
+        printCompilationErrorsAndWarnings(compiledDocker.errors);
+    }
+    return compiledDocker;
+}
+
 /**
  * Separates errors from warnings, formats the messages and prints them. Throws if there is any compilation error (not warning).
  * @param solcErrors The errors field of standard JSON output that contains errors and warnings.
@@ -267,13 +317,11 @@ function recursivelyGatherDependencySources(
 }
 
 /**
- * Gets the solidity compiler instance and full version name. If the compiler is already cached - gets it from FS,
+ * Gets the solidity compiler instance. If the compiler is already cached - gets it from FS,
  * otherwise - fetches it and caches it.
  * @param solcVersion The compiler version. e.g. 0.5.0
  */
-export async function getSolcAsync(
-    solcVersion: string,
-): Promise<{ solcInstance: solc.SolcInstance; fullSolcVersion: string }> {
+export async function getSolcJSAsync(solcVersion: string): Promise<solc.SolcInstance> {
     const fullSolcVersion = binPaths[solcVersion];
     if (_.isUndefined(fullSolcVersion)) {
         throw new Error(`${solcVersion} is not a known compiler version`);
@@ -297,7 +345,7 @@ export async function getSolcAsync(
         throw new Error('No compiler available');
     }
     const solcInstance = solc.setupMethods(requireFromString(solcjs, compilerBinFilename));
-    return { solcInstance, fullSolcVersion };
+    return solcInstance;
 }
 
 /**
